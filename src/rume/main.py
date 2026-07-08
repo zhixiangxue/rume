@@ -7,6 +7,8 @@ Usage:
 
 import asyncio
 import os
+import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -61,6 +63,52 @@ def _resolve_model() -> str:
     return "deepseek/deepseek-chat"
 
 
+# ── output tee (log to file + console) ────────────────────────────
+
+class TeeWriter:
+    """Write to both the original stream and a log file simultaneously."""
+
+    def __init__(self, original, log_fp):
+        self.original = original
+        self.log_fp = log_fp
+
+    def write(self, data):
+        self.original.write(data)
+        self.log_fp.write(data)
+
+    def flush(self):
+        self.original.flush()
+        self.log_fp.flush()
+
+    def isatty(self):
+        return getattr(self.original, "isatty", lambda: False)()
+
+    def fileno(self):
+        return self.original.fileno()
+
+
+def _setup_logging(log_file: Optional[str]) -> tuple:
+    """Set up stdout/stderr tee to log file. Returns (log_path, None) or (None, None).
+
+    If log_file is None, auto-generate a timestamped name.
+    """
+    if log_file is None:
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        log_file = f"rume-{timestamp}.log"
+
+    log_path = Path(log_file).resolve()
+    fp = open(str(log_path), "w", encoding="utf-8")
+
+    # Save originals before wrapping
+    _orig_stdout = sys.stdout
+    _orig_stderr = sys.stderr
+
+    sys.stdout = TeeWriter(_orig_stdout, fp)
+    sys.stderr = TeeWriter(_orig_stderr, fp)
+
+    return log_path, fp
+
+
 # ── main command ──────────────────────────────────────────────────
 
 @app.callback(invoke_without_command=True)
@@ -97,6 +145,14 @@ def main(
             help="Maximum system-level retry attempts",
         ),
     ] = 3,
+    log_file: Annotated[
+        Optional[str],
+        typer.Option(
+            "--log-file",
+            "-l",
+            help="Save all console output to a file (auto-named if not provided)",
+        ),
+    ] = None,
 ):
     """Get any system running — automatically.
 
@@ -132,6 +188,7 @@ def main(
     # Show header
     from rich.console import Console
     from rich.panel import Panel
+    from rich.text import Text
     console = Console()
     console.print()
     console.print(Panel.fit(
@@ -140,6 +197,41 @@ def main(
         subtitle=f"model: {model_uri}",
         border_style="cyan",
     ))
+
+    # ── Safety warning & confirmation ──────────────────────────────
+    console.print()
+    warning = Text.assemble(
+        ("⚠️  WARNING", "bold red reverse"),
+        ("\n\n", ""),
+        ("rume will perform automated operations on your system, including:\n", "yellow"),
+        ("  • Cloning repositories\n", "dim"),
+        ("  • Installing language runtimes & dependencies\n", "dim"),
+        ("  • Running shell commands (build, test, start servers)\n", "dim"),
+        ("  • Reading and writing files in the working directory\n", "dim"),
+        ("  • Making network requests to external services\n", "dim"),
+        ("\nOnly proceed if you trust the source repositories.\n", "bold"),
+    )
+    console.print(Panel(warning, border_style="red"))
+    console.print()
+
+    try:
+        answer = console.input("[bold yellow]Continue?[/bold yellow] [dim](y/N)[/dim] ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        console.print("\n[yellow]Aborted.[/yellow]")
+        raise typer.Exit(code=0)
+
+    if answer not in ("y", "yes"):
+        console.print("[yellow]Aborted by user.[/yellow]")
+        raise typer.Exit(code=0)
+
+    console.print()
+    # ── end warning ────────────────────────────────────────────────
+
+    # ── Set up log file (tee stdout/stderr) ────────────────────────
+    log_path, _log_fp = _setup_logging(log_file)
+    console.print(f"[dim]📝 Logging to: {log_path}[/dim]")
+    console.print()
+    # ── end log setup ──────────────────────────────────────────────
 
     flow = SystemFlow(
         prompt=prompt,

@@ -1,49 +1,69 @@
 """RepoFlow — single-repo orchestration flow.
 
 Nodes: bootstrap_repo → observe → plan → execute → verify → done
-Each LLM-powered node uses Chak Conversation internally.
+Each LLM-powered node uses Chak Conversation with structured output.
 """
 
 import asyncio
 import json
 import os
-import re
 from pathlib import Path
 from typing import Any
 
 from rill.flow import Flow, node, goto, DYNAMIC
 
 from chak import Conversation
-from chak.tools.std import Bash, FileSystem, Http
+from chak.tools.std import Bash, FileSystem, Http, Search, Web
 
 from ..state import RepoState
 from ..tools.git import Git
+from ..tools.docker import Docker
 from ..prompts import load as load_prompt
 from ..hitl import create_hitl_handler
+from ..schemas import (
+    ObserveOutput,
+    PlanOutput,
+    VerifyOutput,
+)
 
 
-# ── helpers ──────────────────────────────────────────────────────────
+def _print_plan(plan: dict, name: str) -> None:
+    """Print the execution plan as a rich table."""
+    from rich.console import Console
+    from rich.table import Table
+    from rich.panel import Panel
 
-def _extract_json(text: str) -> dict[str, Any]:
-    """Extract a JSON object from LLM response text.
+    console = Console()
+    steps = plan.get("steps", [])
+    sc = plan.get("success_criteria", {})
+    use_docker = plan.get("use_docker", False)
 
-    Handles responses wrapped in ```json ... ``` fences or bare JSON.
-    """
-    # Try fenced block first
-    match = re.search(r"```(?:json)?\s*\n?(.*?)\n?```", text, re.DOTALL)
-    if match:
-        text = match.group(1).strip()
+    table = Table(title=f"📋 Execution Plan — {name}", border_style="cyan")
+    table.add_column("#", style="dim", width=3)
+    table.add_column("Purpose", style="bold yellow")
+    table.add_column("Description", style="white")
+    table.add_column("Command", style="dim")
 
-    # Try to find first { ... } or [ ... ]
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1:
-        try:
-            return json.loads(text[start : end + 1])
-        except json.JSONDecodeError:
-            pass
+    for i, step in enumerate(steps, 1):
+        purpose = step.get("purpose", "?")
+        desc = step.get("description", "")
+        cmd = step.get("command", "")
+        # Truncate long commands for display
+        if len(cmd) > 80:
+            cmd = cmd[:77] + "..."
+        table.add_row(str(i), purpose, desc, cmd)
 
-    raise ValueError(f"Failed to parse JSON from LLM response: {text[:200]}...")
+    console.print()
+    console.print(table)
+    console.print()
+
+    # Success criteria & Docker info
+    details = []
+    details.append(f"[bold]Success:[/bold] {sc.get('description', 'N/A')}")
+    if use_docker:
+        details.append("[bold cyan]🐳 Docker mode enabled[/bold cyan]")
+    console.print(Panel.fit("\n".join(details), border_style="green"))
+    console.print()
 
 
 async def _chak_call(
@@ -104,6 +124,7 @@ class RepoFlow(Flow):
         expected_port: int | None = None,
         depends_on: list[str] | None = None,
         global_config: dict[str, Any] | None = None,
+        system_goal: str = "",
     ):
         self.model_uri = model_uri
         self.api_key = api_key
@@ -116,31 +137,40 @@ class RepoFlow(Flow):
             expected_port=expected_port,
             depends_on=depends_on or [],
             global_config=global_config or {},
+            system_goal=system_goal,
         )
         super().__init__(initial_state=initial_state, max_steps=200, validate=True)
         self.state: RepoState
 
     # ── bootstrap_repo ────────────────────────────────────────────
 
-    @node(start=True, goto="observe")
-    async def bootstrap_repo(self, _: Any) -> dict:
-        """Clone the repository into work_dir."""
+    @node(start=True, goto=DYNAMIC)
+    async def bootstrap_repo(self, _: Any) -> Any:
+        """Clone the repository into work_dir.
+
+        If clone fails, go directly to done — there is nothing to observe.
+        """
         s: RepoState = self.state
 
         if s.repo_url.startswith(("http://", "https://", "git@")):
-            # Clone into s.work_dir — must NOT pre-create the target directory,
-            # otherwise git.clone will skip it (directory already exists check).
             parent = os.path.dirname(s.work_dir.rstrip("/"))
             os.makedirs(parent, exist_ok=True)
+            print(f"[bootstrap] Cloning {s.repo_url} → {s.work_dir} ...")
             git = Git(work_dir=parent)
-            result = git.clone(s.repo_url, os.path.basename(s.work_dir))
-            print(f"[bootstrap] {result}")
+            try:
+                result = git.clone(s.repo_url, os.path.basename(s.work_dir))
+                print(f"[bootstrap] {result}")
+            except RuntimeError as e:
+                print(f"[bootstrap] Clone failed: {e}")
+                s.status = "failed"
+                s.error = str(e)
+                return goto(self.done, {"error": str(e)})
         else:
             # Local path — just use as-is
             s.work_dir = os.path.abspath(s.repo_url)
 
         s.status = "running"
-        return {"work_dir": s.work_dir}
+        return goto(self.observe, None)
 
     # ── observe ───────────────────────────────────────────────────
 
@@ -171,16 +201,24 @@ class RepoFlow(Flow):
             f"Return your analysis as JSON."
         )
 
-        tools = [FileSystem(workdir=s.work_dir)]
+        tools = [
+            FileSystem(workdir=s.work_dir),
+            Docker(work_dir=s.work_dir),
+            Web(),
+            Search(),
+        ]
 
         try:
-            resp = await _chak_call(
-                self.model_uri, self.api_key, system_prompt, message, tools=tools
+            data = await _chak_call(
+                self.model_uri, self.api_key, system_prompt, message,
+                tools=tools, returns=ObserveOutput,
             )
-            data = _extract_json(resp.content)
-            s.observations = data
-            print(f"[observe] project_type={data.get('project_type')}, "
-                  f"run_commands={data.get('run_commands')}")
+            if data is None:
+                raise ValueError("Structured output extraction failed — LLM returned None")
+            # Convert to plain dict for backward compatibility with state
+            s.observations = data.model_dump()
+            print(f"[observe] project_type={data.project_type}, "
+                  f"run_commands={data.run_commands}")
             return goto(self.plan, None)
         except ValueError as e:
             print(f"[observe] Failed to parse response: {e}")
@@ -220,17 +258,39 @@ class RepoFlow(Flow):
                 f"Return your execution plan as JSON."
             )
 
-        tools = [FileSystem(workdir=s.work_dir)]
+        tools = [
+            FileSystem(workdir=s.work_dir),
+            Docker(work_dir=s.work_dir),
+            Web(),
+            Search(),
+        ]
 
         try:
-            resp = await _chak_call(
-                self.model_uri, self.api_key, system_prompt, message, tools=tools
+            data = await _chak_call(
+                self.model_uri, self.api_key, system_prompt, message,
+                tools=tools, returns=PlanOutput,
             )
-            data = _extract_json(resp.content)
-            s.plan = data
-            steps = data.get("steps", [])
-            print(f"[plan] {len(steps)} steps planned: "
-                  f"{[st.get('purpose', '?') for st in steps]}")
+            if data is None:
+                raise ValueError("Structured output extraction failed — LLM returned None")
+            s.plan = data.model_dump()
+            steps = s.plan.get("steps", [])
+            _print_plan(s.plan, s.role or os.path.basename(s.work_dir))
+
+            # Ask user to confirm before executing
+            from rich.console import Console
+            console = Console()
+            try:
+                answer = console.input(
+                    "[bold yellow]Execute this plan?[/bold yellow] [dim](Y/n)[/dim] "
+                ).strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                answer = "n"
+
+            if answer in ("n", "no"):
+                print("[plan] Aborted by user.")
+                s.status = "aborted"
+                return goto(self.done, {"error": "User aborted after plan review"})
+
             return goto(self.execute, None)
         except ValueError as e:
             print(f"[plan] Failed to parse response: {e}")
@@ -246,12 +306,17 @@ class RepoFlow(Flow):
         s: RepoState = self.state
 
         plan_json = json.dumps(s.plan, indent=2)
+        # Build goal message: include user's system-level intent if present
+        goal_parts = [f"Get the {s.role} service running"]
+        if s.expected_port:
+            goal_parts.append(f"on port {s.expected_port}")
+        if s.system_goal:
+            goal_parts.append(f"\n\nUser's specific requirements: {s.system_goal}")
+        goal_text = "".join(goal_parts)
+
         system_prompt = load_prompt("execute").format(
             plan=plan_json,
-            goal=(
-                f"Get the {s.role} service running"
-                + (f" on port {s.expected_port}" if s.expected_port else "")
-            ),
+            goal=goal_text,
         )
 
         message = (
@@ -263,8 +328,11 @@ class RepoFlow(Flow):
 
         hitl_handler = create_hitl_handler(no_hitl=self.no_hitl)
         tools = [
-            Bash(working_dir=s.work_dir),
+            Bash(working_dir=s.work_dir, timeout=600),
             FileSystem(workdir=s.work_dir),
+            Docker(work_dir=s.work_dir),
+            Web(),
+            Search(),
         ]
 
         try:
@@ -289,17 +357,20 @@ class RepoFlow(Flow):
 
     @node(goto=DYNAMIC)
     async def verify(self, _: Any) -> Any:
-        """LLM verifies whether the service is running correctly."""
+        """LLM verifies whether the project is ready per the plan's success criteria."""
         s: RepoState = self.state
 
         system_prompt = load_prompt("verify")
-        message = (
-            f"Plan:\n{json.dumps(s.plan, indent=2)}\n\n"
-            f"Execution log:\n{chr(10).join(s.execution_log[-5:])}\n\n"
-            f"Role: {s.role}\n"
-            f"Expected port: {s.expected_port or 'auto-detect'}\n"
-            f"Is the service running? Return your verdict as JSON."
-        )
+        message_parts = [
+            f"Plan:\n{json.dumps(s.plan, indent=2)}",
+            f"Execution log:\n{chr(10).join(s.execution_log[-5:])}",
+            f"Role: {s.role}",
+            f"Expected port: {s.expected_port or 'auto-detect'}",
+        ]
+        if s.system_goal:
+            message_parts.append(f"System goal (USER requirements): {s.system_goal}")
+        message_parts.append("Verify against the plan's success_criteria. Return your verdict as JSON.")
+        message = "\n\n".join(message_parts)
 
         tools = [
             Http(),
@@ -307,19 +378,21 @@ class RepoFlow(Flow):
         ]
 
         try:
-            resp = await _chak_call(
-                self.model_uri, self.api_key, system_prompt, message, tools=tools
+            data = await _chak_call(
+                self.model_uri, self.api_key, system_prompt, message,
+                tools=tools, returns=VerifyOutput,
             )
-            data = _extract_json(resp.content)
-            verdict = data.get("verdict", "FAILED")
+            if data is None:
+                raise ValueError("Structured output extraction failed — LLM returned None")
+            verdict = data.verdict
 
-            print(f"[verify] verdict={verdict}, reason={data.get('reason', '?')}")
+            print(f"[verify] verdict={verdict}, reason={data.reason}")
 
             if verdict == "READY":
                 s.status = "ready"
                 s.result = {
-                    "port": data.get("port"),
-                    "url": data.get("url"),
+                    "port": data.port,
+                    "url": data.url,
                     "verdict": verdict,
                 }
                 # Skip RUME.md generation if it already exists (from reuse)
@@ -332,7 +405,7 @@ class RepoFlow(Flow):
                 return goto(self.observe, None)
             else:  # FAILED
                 s.status = "failed"
-                s.error = data.get("reason", "Unknown error")
+                s.error = data.reason or "Unknown error"
                 return goto(self.done, {"error": s.error})
 
         except ValueError as e:

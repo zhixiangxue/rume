@@ -20,7 +20,12 @@ from rill.flow import Flow, node, goto, DYNAMIC
 
 from ..state import SystemState, ServiceMeta
 from ..prompts import load as load_prompt
-from ..flows.repo_flow import RepoFlow, _extract_json, _chak_call
+from ..flows.repo_flow import RepoFlow, _chak_call
+from ..schemas import (
+    ObserveSystemOutput,
+    PlanSystemOutput,
+    VerifySystemOutput,
+)
 
 
 class SystemFlow(Flow):
@@ -81,25 +86,26 @@ class SystemFlow(Flow):
         system_prompt = load_prompt("observe_system")
 
         try:
-            resp = await _chak_call(
+            data = await _chak_call(
                 self.model_uri,
                 self.api_key,
                 system_prompt,
                 f"User prompt:\n{s.prompt}\n\nAnalyze and return JSON.",
                 tools=[],
+                returns=ObserveSystemOutput,
             )
-            data = _extract_json(resp.content)
-            s.goal = data.get("goal", s.prompt)
-            s.global_config = data.get("global_config", {})
+            if data is None:
+                raise ValueError("Structured output extraction failed — LLM returned None")
+            s.goal = data.goal or s.prompt
+            s.global_config = data.global_config
 
-            services = data.get("services", {})
-            for name, meta in services.items():
+            for name, svc in data.services.items():
                 s.services[name] = ServiceMeta(
-                    repo_url=meta.get("repo_url", ""),
+                    repo_url=svc.repo_url,
                     work_dir=os.path.join(self._work_root, name),
-                    role=meta.get("role", "default"),
-                    expected_port=meta.get("expected_port"),
-                    depends_on=meta.get("depends_on", []),
+                    role=svc.role or "default",
+                    expected_port=svc.expected_port,
+                    depends_on=svc.depends_on,
                 )
 
             print(f"[observe_system] goal={s.goal}")
@@ -135,15 +141,17 @@ class SystemFlow(Flow):
         }
 
         try:
-            resp = await _chak_call(
+            data = await _chak_call(
                 self.model_uri,
                 self.api_key,
                 system_prompt,
                 f"Services:\n{json.dumps(services_desc, indent=2)}\nGoal: {s.goal}\nReturn JSON.",
                 tools=[],
+                returns=PlanSystemOutput,
             )
-            data = _extract_json(resp.content)
-            s.execution_order = data.get("execution_order", [list(s.services.keys())])
+            if data is None:
+                raise ValueError("Structured output extraction failed — LLM returned None")
+            s.execution_order = data.execution_order or [list(s.services.keys())]
             self._console.print(
                 f"[bold]Execution order:[/bold] "
                 f"{' → '.join('[' + '+'.join(b) + ']' for b in s.execution_order)}"
@@ -187,6 +195,7 @@ class SystemFlow(Flow):
                     expected_port=svc.expected_port,
                     depends_on=svc.depends_on,
                     global_config=s.global_config,
+                    system_goal=s.goal,
                 )
                 tasks.append(self._run_repo_flow(name, flow))
 
@@ -213,6 +222,7 @@ class SystemFlow(Flow):
                         expected_port=svc.expected_port,
                         depends_on=svc.depends_on,
                         global_config=s.global_config,
+                        system_goal=s.goal,
                     )
                     tasks.append(self._run_repo_flow(name, flow))
 
@@ -230,6 +240,7 @@ class SystemFlow(Flow):
 
         self._console.print()
         self._console.print(Panel.fit(
+            f"Repo: [dim]{svc.repo_url}[/dim]\n"
             f"Starting RepoFlow for [bold cyan]{name}[/bold cyan]",
             border_style="cyan",
         ))
@@ -274,7 +285,7 @@ class SystemFlow(Flow):
         }
 
         try:
-            resp = await _chak_call(
+            data = await _chak_call(
                 self.model_uri,
                 self.api_key,
                 system_prompt,
@@ -285,12 +296,14 @@ class SystemFlow(Flow):
                     f"Return your verdict as JSON."
                 ),
                 tools=[],
+                returns=VerifySystemOutput,
             )
-            data = _extract_json(resp.content)
-            verdict = data.get("verdict", "GIVE_UP")
-            reason = data.get("reason", "Unknown")
-            retry_services = data.get("retry_services", [])
-            human_question = data.get("human_question", "")
+            if data is None:
+                raise ValueError("Structured output extraction failed — LLM returned None")
+            verdict = data.verdict
+            reason = data.reason
+            retry_services = data.retry_services
+            human_question = data.human_question
 
             print(f"[verify_system] verdict={verdict}, reason={reason}")
 

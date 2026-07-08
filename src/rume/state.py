@@ -54,6 +54,7 @@ class RepoState(BaseModel):
     depends_on: list[str] = Field(default_factory=list)
     expected_port: int | None = None
     global_config: dict[str, Any] = Field(default_factory=dict)
+    system_goal: str = ""  # User's high-level goal, passed from SystemFlow
 
     # observe output
     observations: dict[str, Any] = Field(default_factory=dict)

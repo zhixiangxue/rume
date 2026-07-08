@@ -37,16 +37,34 @@ class Git(SkillBase):
         if os.path.exists(target):
             return f"Directory {target} already exists, skipping clone"
 
-        result = subprocess.run(
-            ["git", "clone", url, target_dir],
+        # Use --progress to force git to emit progress to stderr even
+        # when not attached to a terminal, then stream stderr in
+        # real-time so the user can see clone progress.
+        process = subprocess.Popen(
+            ["git", "clone", "--progress", url, target_dir],
             cwd=self.work_dir,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
         )
-        if result.returncode != 0:
-            return f"Clone failed: {result.stderr.strip()}"
 
-        msg = result.stderr.strip() or result.stdout.strip()
+        # Stream stderr (git progress) to stdout in real-time
+        stderr_lines: list[str] = []
+        if process.stderr:
+            for line in process.stderr:
+                line = line.rstrip("\n")
+                stderr_lines.append(line)
+                # Print progress lines (git progress uses \r for in-place updates)
+                print(f"  {line}", flush=True)
+
+        process.wait()
+        stdout_text = process.stdout.read() if process.stdout else ""
+
+        if process.returncode != 0:
+            raise RuntimeError(f"Clone failed (exit {process.returncode}): "
+                               f"{''.join(stderr_lines[-3:])}")
+
+        msg = "\n".join(stderr_lines) or stdout_text.strip()
         return f"Cloned to {target}\n{msg}"
 
     def status(self) -> str:
